@@ -4,7 +4,8 @@ var historyTrade = {};
 
 (function() {
     var fs = require('fs');    
-    var https = require('https');   
+    var https = require('https');
+    var zlib = require('zlib');
     var ncols = 5;
     
     function parseDataFromFile(data) {
@@ -55,7 +56,7 @@ var historyTrade = {};
         var str = "";
         for (var x in data) {
             str += data.amount.toFixed(3) + ','
-            + data.date.toJson() + ','
+            + data.date.toJSON() + ','
             + data.price.toFixed(3) + ','
             + data.tid + ','
             + data.type + '\n';
@@ -70,113 +71,135 @@ var historyTrade = {};
         }
         return urlPrefix + 'since=' + since;
     }
-        
-    function recursiveRequest(startTid, endTid, coin, allData, func) {
-        // the return data's tid is within the interval: (startTid, endTid]
-        var url = getURL(startTid, coin);
-        https.get(url, function (res) {
-            res.on('data', function (chunk) {
-                var jsonData = [];
-                try {
-                    jsonData = JSON.parse(chunk);
-                } catch(e) {
-                    console.log('exception at: startTid:' + startTid + ' endTid:' + endTid + ' chunk:' + chunk);
-                }
-                var data = parseDataFromJson(jsonData, startTid, endTid);
-                if (data.length > 0) {
-                    allData = allData.concat(data);
-                    console.log('downloaded ' + allData.length + ' records');
-                    if (jsonData[jsonData.length - 1].tid < endTid) {
-                        recursiveRequest(allData[allData.length-1].tid, endTid, coin, allData, func);
-                        return;
-                    }
-                }
-                // cannot download any more data
-                console.log('finished download');
-                func(allData);          
-            });
-        }).on('error', function(e) {
-            console.log("Got error: " + e.message);
-        });
-    }
-
-    historyTrade.since = function requestSince (since, coin, func) {
-        requestData(since, Infinity, coin, func);
-    };
     
-    historyTrade.data = function requestData (startTid, endTid, coin, func) {
-        var allData = [];
-        recursiveRequest(startTid, endTid, coin, allData, func);
-    };
-
-    historyTrade.recent = function requestRecent (diff, coin, func) {        
-        var url = getURL('', coin);
-        https.get(url, function (res) {
-            res.on('data', function (chunk) {
-                var jsonData = [];
-                try {
-                    jsonData = JSON.parse(chunk);
-                } catch(e) {
-                    console.log('exception at: requestRecent(). chunk:' + chunk);
-                    return;
-                }
-                var endTid = jsonData[jsonData.length-1].tid;
-                var data = parseDataFromJson(jsonData, endTid - diff, endTid);
-                if (data.length > 0) {
-                    console.log('downloaded ' + allData.length + ' records');
-                    if (jsonData[0].tid > endTid - diff) {
-                        var startTid = (endTid - diff > 0 ? endTid - diff : 1); 
-                        recursiveRequest(endTid - diff, data[0].tid - 1, coin, [], function (d) {
-                            d = d.concat(data);
-                            func(d);
-                        });
-                    } else {
-                        console.log('finished download');
-                        func(data);
-                    }
-                }
-            });
-        }).on('error', function(e) {
-            console.log("Got error: " + e.message);
-        });     
-    };
-
-    historyTrade.load = function load (filename, func) {
+    historyTrade.load = function load (filename, callback) {
         fs.readFile(filename, function (err, logData) {
             var text = err ? "" : logData.toString();
             var data = parseDataFromFile(text);
-            func(data, err);
+            callback(data, err);
         });
-    }
+    };
     
-    historyTrade.save = function save (filename, data, func) {
+    historyTrade.save = function save (filename, data, callback) {
         var str = prepareOutputData(data);
-        fs.writeFile(filename, str, function (err) {            
-            func(err);
+        fs.writeFile(filename, str, function (err) { 
+            callback(err);
         });
-    }
+    };
     
-    historyTrade.updateRecent = function downloadRecent (filename, coin) {
+    historyTrade.requestOnce = function requestOnce (coin, since, callback) {
+        var url = getURL(since, coin);
+        https.get(url).on('error', function(err) {
+            console.error(err.message);
+        }).on('response', function(response) {
+            var chunks = [];
+            response.on('data', function(chunk) {
+                chunks.push(chunk);
+            }).on('end', function() {
+                var buffer = Buffer.concat(chunks);                
+                switch (response.headers['content-encoding']) {
+                    case 'gzip':
+                        zlib.gunzip(buffer, function(err, decoded) {
+                            callback(err, decoded && decoded.toString());
+                        });                        
+                        break;
+                    case 'deflate':
+                        zlib.inflate(buffer, function(err, decoded) {
+                            callback(err, decoded && decoded.toString());
+                        });
+                        break;
+                    default:
+                        callback(null, buffer.toString());
+                        break;
+                }
+            });
+        });
+    };
+        
+    historyTrade.data = function requestData (startTid, endTid, coin, callback) {
+        // the return data's tid is within the interval: (startTid, endTid]
+        var allData = [];        
+        function handleData(err, data) {
+            if (!err) {
+                var json = [];
+                try {
+                    json = JSON.parse(data);
+                } catch (e) {
+                    console.error('Got error: %s', e.message);
+                }
+                var records = parseDataFromJson(json, startTid, endTid);
+                if (records.length > 0) {
+                    allData = allData.concat(records);
+                    console.log('downloaded ' + allData.length + ' records');
+                    if (json[json.length - 1].tid < endTid) {
+                        requestOnce(coin, allData[allData.length-1].tid, handleData);
+                        return;
+                    }
+                }
+            } else {
+                console.error('Got error: %s', err.message);
+            }
+            console.log('finished download');
+            callback(allData);
+        }
+        requestOnce(coin, startTid, handleData);
+    }
+
+    historyTrade.since = function requestSince (since, coin, callback) {
+        requestData(since, Infinity, coin, callback);
+    };
+
+    historyTrade.recent = function requestRecent (diff, coin, callback) {
+        requestOnce(coin, '', function(err, chunk) {
+            if (!err) {
+                var json = [];
+                try {
+                    json = JSON.parse(chunk);
+                } catch (e) {
+                    console.error('Got error: %s', e.message);
+                }
+                var endTid = json[json.length-1].tid;
+                var data = parseDataFromJson(json, endTid - diff, endTid);
+                if (data.length > 0) {
+                    console.log('downloaded ' + data.length + ' records');
+                    if (json[0].tid > endTid - diff) {
+                        requestData(endTid - diff, data[0].tid - 1, coin, function (d) {
+                            callback(d.concat(data));
+                        });
+                        return;
+                    }
+                } else {
+                    console.error('Got error: %s', err.message);
+                }
+                console.log('finished download');
+                callback(data);
+            } else {
+                console.error('request failed');
+            }
+        });
+    };
+    
+    historyTrade.updateRecent = function updateRecent (filename, coin) {
         load(filename, function (data) {
             var length = data.length;
             var startTid = length > 0 ? data[length-1].tid : 1;
             requestSince(startTid, coin, function (allData) {
                 save(filename, allData, function (err) {
                     if (err) throw err;
-                    console.log('data saved! total ' + allData.length + ' records');
+                    console.log('data saved! total %d records', allData.length);
                 });
             });
-        });        
+        });
     };
-    
-    historyTrade.updateOld = function downloadOld (filename, coin) {
+
+    historyTrade.updateHistory = function updateHistory (filename, coin) {
         load(filename, function (data) {
-            var length = allData.length;
-            var endTid = length > 0 ? data[0].tid - 1: Infinity;
+            var length = data.length;
+            var endTid = length > 0 ? data[0].tid - 1 : Infinity;
             requestData(1, endTid, coin, function (allData) {
                 save(filename, allData, function (err) {
                     if (err) throw err;
-                    console.log('data saved! total ' + allData.length + ' records');
+                    console.log('data saved! total %d records', allData.length);
                 });
             });
         });
