@@ -8,6 +8,8 @@ var historyTrade = {};
     var zlib = require('zlib');
     var ncols = 5;
     
+    // the head of table:
+    // tid time price(cny) amount type
     function parseDataFromFile(data) {
         var allData = [];
         var rows = data.split("\n");
@@ -18,10 +20,10 @@ var historyTrade = {};
                 continue;
             }
             allData.push({
-                amount: parseFloat(cols[0]),
+                amount: parseFloat(cols[3]),
                 date: new Date(cols[1]),
                 price: parseFloat(cols[2]),
-                tid: parseInt(cols[3]),
+                tid: parseInt(cols[0]),                
                 type: cols[4]
             });
         }
@@ -55,16 +57,16 @@ var historyTrade = {};
     function prepareOutputData(data) {
         var str = "";
         for (var x in data) {
-            str += data.amount.toFixed(3) + ','
-            + data.date.toJSON() + ','
-            + data.price.toFixed(3) + ','
-            + data.tid + ','
-            + data.type + '\n';
+            str += data[x].tid + ','
+            + data[x].date.toJSON() + ','
+            + data[x].price.toFixed(3) + ','
+            + data[x].amount.toFixed(3) + ','            
+            + data[x].type + '\n';
         }
         return str;
     }
     
-    function getURL(since, coin) {
+    function getURL(coin, since) {
         var urlPrefix = 'https://www.okcoin.com/api/trades.do?';
         if (coin === 'ltc') {
             urlPrefix += 'symbol=ltc_cny&';
@@ -72,25 +74,25 @@ var historyTrade = {};
         return urlPrefix + 'since=' + since;
     }
     
-    historyTrade.load = function load (filename, callback) {
+    var load = historyTrade.load = function (filename, callback) {
         fs.readFile(filename, function (err, logData) {
             var text = err ? "" : logData.toString();
             var data = parseDataFromFile(text);
-            callback(data, err);
+            callback(err, data);
         });
     };
     
-    historyTrade.save = function save (filename, data, callback) {
+    var save = historyTrade.save = function (filename, data, callback) {
         var str = prepareOutputData(data);
         fs.writeFile(filename, str, function (err) { 
             callback(err);
         });
     };
     
-    historyTrade.requestOnce = function requestOnce (coin, since, callback) {
-        var url = getURL(since, coin);
-        https.get(url).on('error', function(err) {
-            console.error(err.message);
+    var requestOnce = historyTrade.requestOnce = function (coin, since, callback) {
+        var url = getURL(coin, since);
+        https.get(url).on('error', function(err) {            
+            callback(err, null);
         }).on('response', function(response) {
             var chunks = [];
             response.on('data', function(chunk) {
@@ -116,7 +118,7 @@ var historyTrade = {};
         });
     };
         
-    historyTrade.data = function requestData (startTid, endTid, coin, callback) {
+    var requestData = historyTrade.data = function (coin, startTid, endTid, callback) {
         // the return data's tid is within the interval: (startTid, endTid]
         var allData = [];        
         function handleData(err, data) {
@@ -145,11 +147,11 @@ var historyTrade = {};
         requestOnce(coin, startTid, handleData);
     }
 
-    historyTrade.since = function requestSince (since, coin, callback) {
-        requestData(since, Infinity, coin, callback);
+    var requestSince = historyTrade.since = function (coin, since, callback) {
+        requestData(coin, since, Infinity, callback);
     };
 
-    historyTrade.recent = function requestRecent (diff, coin, callback) {
+    var requestRecent = historyTrade.recent = function (coin, diff, callback) {
         requestOnce(coin, '', function(err, chunk) {
             if (!err) {
                 var json = [];
@@ -163,43 +165,53 @@ var historyTrade = {};
                 if (data.length > 0) {
                     console.log('downloaded ' + data.length + ' records');
                     if (json[0].tid > endTid - diff) {
-                        requestData(endTid - diff, data[0].tid - 1, coin, function (d) {
+                        requestData(coin, endTid - diff, data[0].tid - 1, function (d) {
                             callback(d.concat(data));
                         });
-                        return;
+                    } else {
+                        console.log('finished download');
+                        callback(data);
                     }
                 } else {
-                    console.error('Got error: %s', err.message);
+                    console.log('no data downloaded');
                 }
-                console.log('finished download');
-                callback(data);
             } else {
-                console.error('request failed');
+                console.error('Got error: %s', err.message);
             }
         });
     };
     
-    historyTrade.updateRecent = function updateRecent (filename, coin) {
-        load(filename, function (data) {
+    var updateRecent = historyTrade.updateRecent = function (filename, coin, callback) {
+        load(filename, function (err, data) {
             var length = data.length;
             var startTid = length > 0 ? data[length-1].tid : 1;
-            requestSince(startTid, coin, function (allData) {
-                save(filename, allData, function (err) {
-                    if (err) throw err;
-                    console.log('data saved! total %d records', allData.length);
+            requestSince(coin, startTid, function (newData) {
+                data = data.concat(newData);
+                save(filename, data, function (err) {
+                    if (err) {
+                        console.error('failed in save file!');
+                    } else {
+                        console.log('data saved! total %d records', data.length);
+                    }
+                    callback(err);
                 });
             });
         });
     };
 
-    historyTrade.updateHistory = function updateHistory (filename, coin) {
-        load(filename, function (data) {
+    var updateHistory = historyTrade.updateHistory = function (filename, coin, callback) {
+        load(filename, function (err, data) {
             var length = data.length;
             var endTid = length > 0 ? data[0].tid - 1 : Infinity;
-            requestData(1, endTid, coin, function (allData) {
-                save(filename, allData, function (err) {
-                    if (err) throw err;
-                    console.log('data saved! total %d records', allData.length);
+            requestData(coin, 1, endTid, function (oldData) {
+                data = oldData.concat(data);
+                save(filename, data, function (err) {
+                    if (err) {
+                        console.error('failed in save file!');
+                    } else {
+                        console.log('data saved! total %d records', data.length);
+                    }
+                    callback(err);
                 });
             });
         });
